@@ -4,14 +4,14 @@
 
 # --- 1. CONFIGURATION ---
 # *********************************************************************************************
-# IMPORTANTE: Modifica estos valores
+# IMPORTANT: Modify these values
 # *********************************************************************************************
 $SqlServerInstance = "TU_SERVIDOR\NOMBRE_DE_INSTANCIA" 
+$DatabaseName = "master" # Base database name for the initial connection (Fixed the name here)
 $UseWindowsAuth = $true # Set to $false if using SQL Authentication
 $SqlUser = "usuario_sql" # Only needed if $UseWindowsAuth is $false
 $SqlPass = "tu_contraseña"  # Only needed if $UseWindowsAuth is $false
-$MasterDbName = "master" # Connection entry point
-$OutputFile = "C:\Users\YourUser\Documents\SQLServer_Inventory_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
+$OutputFile = "C:\InventarioBD\SQLServer_Inventory_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
 
 # Variable to store all results
 $GlobalInventory = @()
@@ -24,16 +24,17 @@ Add-Type -AssemblyName System.Data
 
 function Invoke-SqlClientQuery {
     param(
-        [Parameter(Mandatory=$true)][string]$DatabaseName,
+        [Parameter(Mandatory=$true)][string]$CurrentDB, # Using CurrentDB to avoid conflict with $DatabaseName global var
         [Parameter(Mandatory=$true)][string]$Query,
         [Parameter(Mandatory=$false)][switch]$IsCountQuery
     )
 
     # Building the connection string based on global parameters
     if ($global:UseWindowsAuth) {
-        $ConnectionString = "Server=$global:SqlServerInstance;Database=$DatabaseName;Integrated Security=True;Connection Timeout=10;"
+        # Using $CurrentDB here to connect to the specific database
+        $ConnectionString = "Server=$global:SqlServerInstance;Database=$CurrentDB;Integrated Security=True;Connection Timeout=10;"
     } else {
-        $ConnectionString = "Server=$global:SqlServerInstance;Database=$DatabaseName;User ID=$global:SqlUser;Password=$global:SqlPass;Connection Timeout=10;"
+        $ConnectionString = "Server=$global:SqlServerInstance;Database=$CurrentDB;User ID=$global:SqlUser;Password=$global:SqlPass;Connection Timeout=10;"
     }
     
     $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
@@ -43,19 +44,15 @@ function Invoke-SqlClientQuery {
         $SqlConnection.Open()
         $SqlCommand = New-Object System.Data.SqlClient.SqlCommand($Query, $SqlConnection)
         
-        # If it's a simple count, return the scalar result
         if ($IsCountQuery) {
-            # ExecuteScalar is faster for a single value (like COUNT)
             $result = $SqlCommand.ExecuteScalar()
             return $result
         }
         
-        # Otherwise, return a dataset reader
         $SqlReader = $SqlCommand.ExecuteReader()
         $results = @()
         while ($SqlReader.Read()) {
             $row = New-Object PSObject
-            # Dynamically add properties based on the query result
             $SqlReader.GetSchemaTable().Rows | ForEach-Object {
                 $propertyName = $_.ColumnName
                 $propertyValue = $SqlReader.Item($propertyName)
@@ -67,8 +64,8 @@ function Invoke-SqlClientQuery {
         return $results
 
     } catch {
-        # Return the error message or a specific string for the main script to handle status
-        return "ERROR: $($_.Exception.Message)"
+        # Returning a simplified error message string to avoid variable interpolation issues in the main script
+        return "ERROR: Connection or Query failed. Message: $($_.Exception.Message)"
     } finally {
         if ($SqlConnection -ne $null -and $SqlConnection.State -eq [System.Data.ConnectionState]::Open) {
             $SqlConnection.Close()
@@ -83,20 +80,19 @@ Write-Host "Starting SQL Server inventory for: $SqlServerInstance" -ForegroundCo
 
 # 3.1. Get Server Version and Initial Status
 $VersionQuery = "SELECT @@VERSION AS Version"
-$ServerInfo = Invoke-SqlClientQuery -DatabaseName $MasterDbName -Query $VersionQuery
+$ServerInfo = Invoke-SqlClientQuery -CurrentDB $DatabaseName -Query $VersionQuery
 
 if ($ServerInfo -is [string] -and $ServerInfo.StartsWith("ERROR:")) {
     Write-Error "Server connection failed: $($ServerInfo)"
     $GlobalInventory += New-Object PSObject -Property @{
         Technology = "SQL Server";
         Version = "N/A";
-        DatabaseName = $MasterDbName;
+        DatabaseName = $DatabaseName;
         Status = "Server Disconnected";
         TableName = "N/A";
         SchemaName = "N/A";
         HasData = "N/A"
     }
-    # Exit script if server connection fails
     return
 }
 
@@ -107,10 +103,11 @@ Write-Host "Found SQL Server Version: $SqlServerVersion" -ForegroundColor Yellow
 
 # 3.2. Get List of User Databases
 $DBListQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';" 
-$UserDatabases = Invoke-SqlClientQuery -DatabaseName $MasterDbName -Query $DBListQuery
+# Connect to $DatabaseName ("master") to get the list
+$UserDatabases = Invoke-SqlClientQuery -CurrentDB $DatabaseName -Query $DBListQuery
 
 if ($UserDatabases -is [string] -and $UserDatabases.StartsWith("ERROR:")) {
-    Write-Error "Failed to retrieve database list."
+    Write-Error "Failed to retrieve database list from $DatabaseName."
     return
 }
 
@@ -120,23 +117,26 @@ foreach ($DB in $UserDatabases) {
     Write-Host "  -> Processing Database: $CurrentDBName" -ForegroundColor Green
 
     # Query 1: Get all tables and schemas in the current database
+    # Note: We must connect to $CurrentDBName to execute this query
     $TablesQuery = @"
     SELECT
         s.name AS SchemaName,
         t.name AS TableName
     FROM
-        $CurrentDBName.sys.tables t
+        sys.tables t
     INNER JOIN
-        $CurrentDBName.sys.schemas s ON t.schema_id = s.schema_id
+        sys.schemas s ON t.schema_id = s.schema_id
     WHERE
         t.is_ms_shipped = 0 
     ORDER BY SchemaName, TableName;
 "@
 
-    $Tables = Invoke-SqlClientQuery -DatabaseName $CurrentDBName -Query $TablesQuery
+    $Tables = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $TablesQuery
     
+    # Check for errors during table query (database level)
     if ($Tables -is [string] -and $Tables.StartsWith("ERROR:")) {
-        Write-Error "   Error querying tables in $CurrentDBName: $($Tables)"
+        # FIX: Concatenate the message instead of interpolating the raw error string
+        Write-Error ("Error querying tables in " + $CurrentDBName + ". " + $Tables)
         $GlobalInventory += New-Object PSObject -Property @{
             Technology = "SQL Server";
             Version = $SqlServerVersion;
@@ -156,7 +156,7 @@ foreach ($DB in $UserDatabases) {
 
         # Query 2: Check for data (Row Count)
         $CountQuery = "SELECT COUNT_BIG(*) FROM [$Schema].[$TableName];"
-        $RowCount = Invoke-SqlClientQuery -DatabaseName $CurrentDBName -Query $CountQuery -IsCountQuery
+        $RowCount = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $CountQuery -IsCountQuery
         
         $HasData = if ($RowCount -gt 0) { "Yes" } else { "No" }
         
@@ -165,14 +165,13 @@ foreach ($DB in $UserDatabases) {
             Technology = "SQL Server";
             Version = $SqlServerVersion;
             DatabaseName = $CurrentDBName;
-            Status = "Connected"; # Assuming connection succeeded here
+            Status = "Connected"; # Status here is connected at the table level
             TableName = $TableName;
             SchemaName = $Schema;
             HasData = $HasData
         }
         
         $GlobalInventory += $TableObject
-        # Write-Host "     -> Table: $Schema.$TableName (Data: $HasData)" -ForegroundColor DarkGray
     }
 }
 
