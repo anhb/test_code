@@ -101,6 +101,7 @@ if ($ServerInfo -is [string] -and $ServerInfo.StartsWith("ERROR:")) {
 }
 
 $SqlServerVersion = ($ServerInfo[0].Version.Split("`n"))[0].Trim() 
+$ServerInstanceName = $SqlServerInstance # Storing the instance name for CSV
 Write-Host "Found SQL Server Version: $SqlServerVersion" -ForegroundColor Yellow
 Write-InventoryLog "SUCCESS: Server connected. Version: $SqlServerVersion"
 
@@ -125,7 +126,7 @@ foreach ($DB in $UserDatabases) {
     SELECT
         t.TABLE_SCHEMA AS SchemaName,
         t.TABLE_NAME AS TableName,
-        t.TABLE_TYPE AS TableType -- New column for table type
+        t.TABLE_TYPE AS TableType
     FROM
         INFORMATION_SCHEMA.TABLES t
     WHERE
@@ -140,15 +141,18 @@ foreach ($DB in $UserDatabases) {
         Write-InventoryLog "ERROR: Skipping database $CurrentDBName. Likely permissions issue. Error: $($Tables)"
         
         $GlobalTableInventory += New-Object PSObject -Property @{
-            Version = $SqlServerVersion; DatabaseName = $CurrentDBName; Status = "Access Denied";
+            Version = $SqlServerVersion; ServerName = $ServerInstanceName; DatabaseName = $CurrentDBName; Status = "Access Denied";
             HasData = "N/A"; TableType = "N/A"; TableName = "N/A"; SchemaName = "N/A"
         }
         continue 
     }
 
     # Query 2: Get all column information for the current database
+    # Added Version and ServerName to the SELECT query output for the Column Inventory
     $ColumnsQuery = @"
     SELECT
+        '$SqlServerVersion' AS Version,
+        '$ServerInstanceName' AS ServerName,
         '$CurrentDBName' AS DatabaseName,
         c.TABLE_SCHEMA AS SchemaName,
         c.TABLE_NAME AS TableName,
@@ -193,12 +197,13 @@ foreach ($DB in $UserDatabases) {
             }
         }
         
-        # Create the final table object 
+        # Create the final table object with new ServerName property
         $TableObject = New-Object PSObject -Property @{
             Version = $SqlServerVersion;
+            ServerName = $ServerInstanceName; # New property
             DatabaseName = $CurrentDBName;
             Status = $Status;
-            TableType = $TableType; # New column
+            TableType = $TableType; 
             SchemaName = $Schema;
             TableName = $TableName;
             HasData = $HasData;
@@ -213,12 +218,13 @@ foreach ($DB in $UserDatabases) {
 
 if ($GlobalTableInventory.Count -gt 0) {
     
-    # 4.1 Export TABLES Inventory
+    # 4.1 Export TABLES Inventory: ServerName added after Version
     $TableCsvProperties = @(
         'Version', 
+        'ServerName', # New position
         'DatabaseName', 
         'Status', 
-        'TableType', # Added
+        'TableType', 
         'SchemaName', 
         'TableName',
         'HasData'
@@ -227,9 +233,11 @@ if ($GlobalTableInventory.Count -gt 0) {
     Write-InventoryLog "SUCCESS: Tables inventory exported to $TableOutputFile."
     Write-Host "`n✅ Tables Inventory exported to: $TableOutputFile" -ForegroundColor Green
 
-    # 4.2 Export COLUMNS Inventory
+    # 4.2 Export COLUMNS Inventory: Version and ServerName are included in the SELECT query and implicitly ordered here
     if ($GlobalColumnInventory.Count -gt 0) {
         $ColumnCsvProperties = @(
+            'Version', # New position
+            'ServerName', # New position
             'DatabaseName',
             'SchemaName',
             'TableName',
