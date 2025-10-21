@@ -1,16 +1,22 @@
 # ------------------------------------------------------------------------------------------------
-# SQL SERVER INVENTORY SCRIPT (Using native .NET Provider: SqlClient)
+# SQL SERVER INVENTORY SCRIPT (Using native .NET Provider: SqlClient) - MULTI-INSTANCE SUPPORT
+# Generates two CSV files: one for tables and one for columns, including Server Name and Version.
 # ------------------------------------------------------------------------------------------------
 
 # --- 1. CONFIGURATION ---
 # *********************************************************************************************
-# IMPORTANT: Modify these values
+# IMPORTANT: Define all SQL Server instances you want to inventory in this array.
+#            Example: @("SERVER1\INST1", "SERVER2\SQLDEV", "LOCALSERVER")
 # *********************************************************************************************
-$SqlServerInstance = "TU_SERVIDOR\NOMBRE_DE_INSTANCIA" 
-$DatabaseName = "master" # Base database name for the initial connection (Fixed the name here)
-$UseWindowsAuth = $true # Set to $false if using SQL Authentication
-$SqlUser = "usuario_sql" # Only needed if $UseWindowsAuth is $false
-$SqlPass = "tu_contraseña"  # Only needed if $UseWindowsAuth is $false
+$SqlServerInstances = @(
+    "TU_SERVIDOR_1\NOMBRE_DE_INSTANCIA", # <-- MODIFY HERE: Instance 1
+    "TU_SERVIDOR_2\NOMBRE_DE_INSTANCIA_2" # <-- MODIFY HERE: Instance 2 (Add or remove as needed)
+)
+ 
+$DatabaseName = "master" # Connection entry point
+$UseWindowsAuth = $true 
+$SqlUser = "usuario_sql" 
+$SqlPass = "tu_contraseña" 
 $Timestamp = Get-Date -Format yyyyMMdd_HHmmss
 $TableOutputFile = "C:\InventarioBD\SQLServer_Inventory_Tables_$Timestamp.csv"
 $ColumnOutputFile = "C:\InventarioBD\SQLServer_Inventory_Columns_$Timestamp.csv"
@@ -32,8 +38,10 @@ function Write-InventoryLog {
     "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append
 }
 
+# NOTE: Invoke-SqlClientQuery now uses $ServerInstance for the connection string
 function Invoke-SqlClientQuery {
     param(
+        [Parameter(Mandatory=$true)][string]$ServerInstance, # New parameter for the current server
         [Parameter(Mandatory=$true)][string]$CurrentDB, 
         [Parameter(Mandatory=$true)][string]$Query,
         [Parameter(Mandatory=$false)][switch]$IsCountQuery
@@ -41,9 +49,9 @@ function Invoke-SqlClientQuery {
     
     # Building the connection string
     if ($global:UseWindowsAuth) {
-        $ConnectionString = "Server=$global:SqlServerInstance;Database=$CurrentDB;Integrated Security=True;Connection Timeout=10;"
+        $ConnectionString = "Server=$ServerInstance;Database=$CurrentDB;Integrated Security=True;Connection Timeout=10;"
     } else {
-        $ConnectionString = "Server=$global:SqlServerInstance;Database=$CurrentDB;User ID=$global:SqlUser;Password=$global:SqlPass;Connection Timeout=10;"
+        $ConnectionString = "Server=$ServerInstance;Database=$CurrentDB;User ID=$global:SqlUser;Password=$global:SqlPass;Connection Timeout=10;"
     }
     
     $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
@@ -80,7 +88,6 @@ function Invoke-SqlClientQuery {
     }
 }
 
-
 # --- 3. MAIN INVENTORY EXECUTION ---
 
 # Create log directory if it doesn't exist
@@ -88,140 +95,153 @@ $OutputDir = Split-Path $TableOutputFile -Parent
 if (-not (Test-Path $OutputDir)) {
     New-Item -Path $OutputDir -ItemType Directory | Out-Null
 }
-Write-InventoryLog "--- Inventory started for $SqlServerInstance ---"
+Write-InventoryLog "--- Inventory started for all defined SQL Server instances ---"
 
-# 3.1. Get Server Version and Initial Status
-$VersionQuery = "SELECT @@VERSION AS Version"
-$ServerInfo = Invoke-SqlClientQuery -CurrentDB $DatabaseName -Query $VersionQuery
-
-if ($ServerInfo -is [string] -and $ServerInfo.StartsWith("ERROR:")) {
-    Write-Error "Server connection failed. Check log file for details."
-    Write-InventoryLog "FATAL: Server connection failed to $SqlServerInstance. Error: $($ServerInfo)"
-    return
-}
-
-$SqlServerVersion = ($ServerInfo[0].Version.Split("`n"))[0].Trim() 
-$ServerInstanceName = $SqlServerInstance # Storing the instance name for CSV
-Write-Host "Found SQL Server Version: $SqlServerVersion" -ForegroundColor Yellow
-Write-InventoryLog "SUCCESS: Server connected. Version: $SqlServerVersion"
-
-
-# 3.2. Get List of User Databases
-$DBListQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';" 
-$UserDatabases = Invoke-SqlClientQuery -CurrentDB $DatabaseName -Query $DBListQuery
-
-if ($UserDatabases -is [string] -and $UserDatabases.StartsWith("ERROR:")) {
-    Write-Error "Failed to retrieve database list."
-    Write-InventoryLog "ERROR: Failed to retrieve database list from $DatabaseName. Error: $($UserDatabases)"
-    return
-}
-
-# 3.3. Iterate over each Database
-foreach ($DB in $UserDatabases) {
-    $CurrentDBName = $DB.name
-    Write-Host "  -> Processing Database: $CurrentDBName" -ForegroundColor Green
-
-    # Query 1: Get all tables and schemas, including type (BASE TABLE, VIEW, etc.)
-    $TablesQuery = @"
-    SELECT
-        t.TABLE_SCHEMA AS SchemaName,
-        t.TABLE_NAME AS TableName,
-        t.TABLE_TYPE AS TableType
-    FROM
-        INFORMATION_SCHEMA.TABLES t
-    WHERE
-        t.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
-    ORDER BY SchemaName, TableName;
-"@
-
-    $Tables = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $TablesQuery
+# Main loop that iterates over each SQL Server instance
+foreach ($ServerInstanceName in $SqlServerInstances) {
     
-    if ($Tables -is [string] -and $Tables.StartsWith("ERROR:")) {
-        Write-Warning "   Skipping database $CurrentDBName due to error. Details logged."
-        Write-InventoryLog "ERROR: Skipping database $CurrentDBName. Likely permissions issue. Error: $($Tables)"
+    Write-Host "`n========================================================" -ForegroundColor White
+    Write-Host "STARTING INVENTORY FOR SERVER: $ServerInstanceName" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor White
+    Write-InventoryLog "Processing Server: $ServerInstanceName"
+
+    # 3.1. Get Server Version and Initial Status
+    $VersionQuery = "SELECT @@VERSION AS Version"
+    $ServerInfo = Invoke-SqlClientQuery -ServerInstance $ServerInstanceName -CurrentDB $DatabaseName -Query $VersionQuery
+
+    if ($ServerInfo -is [string] -and $ServerInfo.StartsWith("ERROR:")) {
+        Write-Error "Server connection failed for $ServerInstanceName. Check log file for details."
+        Write-InventoryLog "FATAL: Server connection failed to $ServerInstanceName. Error: $($ServerInfo)"
         
+        # Add a record for failed server connection
         $GlobalTableInventory += New-Object PSObject -Property @{
-            Version = $SqlServerVersion; ServerName = $ServerInstanceName; DatabaseName = $CurrentDBName; Status = "Access Denied";
+            Version = "N/A"; ServerName = $ServerInstanceName; DatabaseName = $DatabaseName; Status = "Server Disconnected";
             HasData = "N/A"; TableType = "N/A"; TableName = "N/A"; SchemaName = "N/A"
         }
-        continue 
+        continue # Skip to the next server in the array
     }
 
-    # Query 2: Get all column information for the current database
-    # Added Version and ServerName to the SELECT query output for the Column Inventory
-    $ColumnsQuery = @"
-    SELECT
-        '$SqlServerVersion' AS Version,
-        '$ServerInstanceName' AS ServerName,
-        '$CurrentDBName' AS DatabaseName,
-        c.TABLE_SCHEMA AS SchemaName,
-        c.TABLE_NAME AS TableName,
-        c.COLUMN_NAME AS ColumnName,
-        c.ORDINAL_POSITION AS OrdinalPosition,
-        c.DATA_TYPE AS DataType,
-        c.CHARACTER_MAXIMUM_LENGTH AS MaxLength,
-        c.IS_NULLABLE AS IsNullable
-    FROM
-        INFORMATION_SCHEMA.COLUMNS c
-    WHERE
-        c.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
-    ORDER BY SchemaName, TableName, OrdinalPosition;
+    $SqlServerVersion = ($ServerInfo[0].Version.Split("`n"))[0].Trim() 
+    Write-Host "Found SQL Server Version: $SqlServerVersion" -ForegroundColor Yellow
+    Write-InventoryLog "SUCCESS: Server $ServerInstanceName connected. Version: $SqlServerVersion"
+
+
+    # 3.2. Get List of User Databases
+    $DBListQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';" 
+    $UserDatabases = Invoke-SqlClientQuery -ServerInstance $ServerInstanceName -CurrentDB $DatabaseName -Query $DBListQuery
+
+    if ($UserDatabases -is [string] -and $UserDatabases.StartsWith("ERROR:")) {
+        Write-Error "Failed to retrieve database list for $ServerInstanceName."
+        Write-InventoryLog "ERROR: Failed to retrieve database list from $DatabaseName on $ServerInstanceName. Error: $($UserDatabases)"
+        continue # Skip to the next server
+    }
+
+    # 3.3. Iterate over each Database
+    foreach ($DB in $UserDatabases) {
+        $CurrentDBName = $DB.name
+        Write-Host "  -> Processing Database: $CurrentDBName" -ForegroundColor Green
+
+        # Query 1: Get all tables and schemas, including type (BASE TABLE, VIEW, etc.)
+        $TablesQuery = @"
+        SELECT
+            t.TABLE_SCHEMA AS SchemaName,
+            t.TABLE_NAME AS TableName,
+            t.TABLE_TYPE AS TableType
+        FROM
+            INFORMATION_SCHEMA.TABLES t
+        WHERE
+            t.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
+        ORDER BY SchemaName, TableName;
 "@
-    $Columns = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $ColumnsQuery
-    
-    if ($Columns -is [string] -and $Columns.StartsWith("ERROR:")) {
-         Write-InventoryLog "WARNING: Could not retrieve column details for $CurrentDBName. Error: $($Columns)"
-    } else {
-        $GlobalColumnInventory += $Columns
-    }
 
-
-    # Iterate over each Table for row count (only for BASE TABLE)
-    foreach ($Table in $Tables) {
-        $Schema = $Table.SchemaName
-        $TableName = $Table.TableName
-        $TableType = $Table.TableType
-        $Status = "Connected"
-        $HasData = "N/A"
-
-        if ($TableType -eq 'BASE TABLE') {
-            # Query 3: Check for data (Row Count)
-            $CountQuery = "SELECT COUNT_BIG(*) FROM [$Schema].[$TableName];"
-            $RowCount = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $CountQuery -IsCountQuery
+        $Tables = Invoke-SqlClientQuery -ServerInstance $ServerInstanceName -CurrentDB $CurrentDBName -Query $TablesQuery
+        
+        if ($Tables -is [string] -and $Tables.StartsWith("ERROR:")) {
+            Write-Warning "   Skipping database $CurrentDBName on $ServerInstanceName due to error. Details logged."
+            Write-InventoryLog "ERROR: Skipping database $CurrentDBName on $ServerInstanceName. Likely permissions issue. Error: $($Tables)"
             
-            if ($RowCount -is [string] -and $RowCount.StartsWith("ERROR:")) {
-                Write-InventoryLog "WARNING: Could not count rows in $CurrentDBName.$Schema.$TableName. Skipping row count. Error: $($RowCount)"
-                $Status = "Connected (No Count Permission)"
-            } else {
-                $HasData = if ($RowCount -gt 0) { "Yes" } else { "No" }
+            $GlobalTableInventory += New-Object PSObject -Property @{
+                Version = $SqlServerVersion; ServerName = $ServerInstanceName; DatabaseName = $CurrentDBName; Status = "Access Denied";
+                HasData = "N/A"; TableType = "N/A"; TableName = "N/A"; SchemaName = "N/A"
             }
+            continue 
         }
+
+        # Query 2: Get all column information for the current database
+        $ColumnsQuery = @"
+        SELECT
+            '$SqlServerVersion' AS Version,
+            '$ServerInstanceName' AS ServerName,
+            '$CurrentDBName' AS DatabaseName,
+            c.TABLE_SCHEMA AS SchemaName,
+            c.TABLE_NAME AS TableName,
+            c.COLUMN_NAME AS ColumnName,
+            c.ORDINAL_POSITION AS OrdinalPosition,
+            c.DATA_TYPE AS DataType,
+            c.CHARACTER_MAXIMUM_LENGTH AS MaxLength,
+            c.IS_NULLABLE AS IsNullable
+        FROM
+            INFORMATION_SCHEMA.COLUMNS c
+        WHERE
+            c.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
+        ORDER BY SchemaName, TableName, OrdinalPosition;
+"@
+        $Columns = Invoke-SqlClientQuery -ServerInstance $ServerInstanceName -CurrentDB $CurrentDBName -Query $ColumnsQuery
         
-        # Create the final table object with new ServerName property
-        $TableObject = New-Object PSObject -Property @{
-            Version = $SqlServerVersion;
-            ServerName = $ServerInstanceName; # New property
-            DatabaseName = $CurrentDBName;
-            Status = $Status;
-            TableType = $TableType; 
-            SchemaName = $Schema;
-            TableName = $TableName;
-            HasData = $HasData;
+        if ($Columns -is [string] -and $Columns.StartsWith("ERROR:")) {
+            Write-InventoryLog "WARNING: Could not retrieve column details for $CurrentDBName on $ServerInstanceName. Error: $($Columns)"
+        } else {
+            $GlobalColumnInventory += $Columns
         }
-        
-        $GlobalTableInventory += $TableObject
-    }
-}
+
+
+        # Iterate over each Table for row count (only for BASE TABLE)
+        foreach ($Table in $Tables) {
+            $Schema = $Table.SchemaName
+            $TableName = $Table.TableName
+            $TableType = $Table.TableType
+            $Status = "Connected"
+            $HasData = "N/A"
+
+            if ($TableType -eq 'BASE TABLE') {
+                # Query 3: Check for data (Row Count)
+                $CountQuery = "SELECT COUNT_BIG(*) FROM [$Schema].[$TableName];"
+                $RowCount = Invoke-SqlClientQuery -ServerInstance $ServerInstanceName -CurrentDB $CurrentDBName -Query $CountQuery -IsCountQuery
+                
+                if ($RowCount -is [string] -and $RowCount.StartsWith("ERROR:")) {
+                    Write-InventoryLog "WARNING: Could not count rows in $CurrentDBName.$Schema.$TableName on $ServerInstanceName. Skipping row count. Error: $($RowCount)"
+                    $Status = "Connected (No Count Permission)"
+                } else {
+                    $HasData = if ($RowCount -gt 0) { "Yes" } else { "No" }
+                }
+            }
+            
+            # Create the final table object 
+            $TableObject = New-Object PSObject -Property @{
+                Version = $SqlServerVersion;
+                ServerName = $ServerInstanceName;
+                DatabaseName = $CurrentDBName;
+                Status = $Status;
+                TableType = $TableType; 
+                SchemaName = $Schema;
+                TableName = $TableName;
+                HasData = $HasData;
+            }
+            
+            $GlobalTableInventory += $TableObject
+        } # End of Table loop
+    } # End of Database loop
+} # End of Server loop
 
 
 # --- 4. EXPORT RESULTS TO CSV ---
 
 if ($GlobalTableInventory.Count -gt 0) {
     
-    # 4.1 Export TABLES Inventory: ServerName added after Version
+    # 4.1 Export TABLES Inventory
     $TableCsvProperties = @(
         'Version', 
-        'ServerName', # New position
+        'ServerName', 
         'DatabaseName', 
         'Status', 
         'TableType', 
@@ -233,11 +253,11 @@ if ($GlobalTableInventory.Count -gt 0) {
     Write-InventoryLog "SUCCESS: Tables inventory exported to $TableOutputFile."
     Write-Host "`n✅ Tables Inventory exported to: $TableOutputFile" -ForegroundColor Green
 
-    # 4.2 Export COLUMNS Inventory: Version and ServerName are included in the SELECT query and implicitly ordered here
+    # 4.2 Export COLUMNS Inventory
     if ($GlobalColumnInventory.Count -gt 0) {
         $ColumnCsvProperties = @(
-            'Version', # New position
-            'ServerName', # New position
+            'Version', 
+            'ServerName', 
             'DatabaseName',
             'SchemaName',
             'TableName',
