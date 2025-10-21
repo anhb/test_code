@@ -11,17 +11,26 @@ $DatabaseName = "master" # Base database name for the initial connection (Fixed 
 $UseWindowsAuth = $true # Set to $false if using SQL Authentication
 $SqlUser = "usuario_sql" # Only needed if $UseWindowsAuth is $false
 $SqlPass = "tu_contraseña"  # Only needed if $UseWindowsAuth is $false
-$OutputFile = "C:\InventarioBD\SQLServer_Inventory_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
-$LogFile = "C:\InventarioBD\SQLServer_Inventory_$(Get-Date -Format yyyyMMdd_HHmmss).log"
+$Timestamp = Get-Date -Format yyyyMMdd_HHmmss
+$TableOutputFile = "C:\InventarioBD\SQLServer_Inventory_Tables_$Timestamp.csv"
+$ColumnOutputFile = "C:\InventarioBD\SQLServer_Inventory_Columns_$Timestamp.csv"
+$LogFile = "C:\InventarioBD\SQLServer_Inventory_$Timestamp.log"
 
-# Variable to store all results
-$GlobalInventory = @()
+# Variables to store results
+$GlobalTableInventory = @()
+$GlobalColumnInventory = @()
 
 # Load the .NET Assembly for SQL Server connectivity
 Add-Type -AssemblyName System.Data
 
 
-# --- 2. SQL CLIENT QUERY FUNCTION ---
+# --- 2. SQL CLIENT QUERY & LOGGING FUNCTIONS ---
+
+function Write-InventoryLog {
+    param([string]$Message)
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append
+}
 
 function Invoke-SqlClientQuery {
     param(
@@ -29,7 +38,8 @@ function Invoke-SqlClientQuery {
         [Parameter(Mandatory=$true)][string]$Query,
         [Parameter(Mandatory=$false)][switch]$IsCountQuery
     )
-
+    
+    # Building the connection string
     if ($global:UseWindowsAuth) {
         $ConnectionString = "Server=$global:SqlServerInstance;Database=$CurrentDB;Integrated Security=True;Connection Timeout=10;"
     } else {
@@ -44,8 +54,7 @@ function Invoke-SqlClientQuery {
         $SqlCommand = New-Object System.Data.SqlClient.SqlCommand($Query, $SqlConnection)
         
         if ($IsCountQuery) {
-            $result = $SqlCommand.ExecuteScalar()
-            return $result
+            return $SqlCommand.ExecuteScalar()
         }
         
         $SqlReader = $SqlCommand.ExecuteReader()
@@ -63,7 +72,6 @@ function Invoke-SqlClientQuery {
         return $results
 
     } catch {
-        # Return a simplified error message string
         return "ERROR: Connection or Query failed. Full Message: $($_.Exception.Message)"
     } finally {
         if ($SqlConnection -ne $null -and $SqlConnection.State -eq [System.Data.ConnectionState]::Open) {
@@ -76,20 +84,11 @@ function Invoke-SqlClientQuery {
 # --- 3. MAIN INVENTORY EXECUTION ---
 
 # Create log directory if it doesn't exist
-$OutputDir = Split-Path $OutputFile -Parent
+$OutputDir = Split-Path $TableOutputFile -Parent
 if (-not (Test-Path $OutputDir)) {
     New-Item -Path $OutputDir -ItemType Directory | Out-Null
 }
-
-function Write-InventoryLog {
-    param([string]$Message)
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append
-}
-
-Write-Host "Starting SQL Server inventory for: $SqlServerInstance" -ForegroundColor Cyan
 Write-InventoryLog "--- Inventory started for $SqlServerInstance ---"
-
 
 # 3.1. Get Server Version and Initial Status
 $VersionQuery = "SELECT @@VERSION AS Version"
@@ -98,10 +97,6 @@ $ServerInfo = Invoke-SqlClientQuery -CurrentDB $DatabaseName -Query $VersionQuer
 if ($ServerInfo -is [string] -and $ServerInfo.StartsWith("ERROR:")) {
     Write-Error "Server connection failed. Check log file for details."
     Write-InventoryLog "FATAL: Server connection failed to $SqlServerInstance. Error: $($ServerInfo)"
-    $GlobalInventory += New-Object PSObject -Property @{
-        Technology = "SQL Server"; Version = "N/A"; DatabaseName = $DatabaseName; Status = "Server Disconnected";
-        HasData = "N/A"; TableName = "N/A"; SchemaName = "N/A"
-    }
     return
 }
 
@@ -125,18 +120,16 @@ foreach ($DB in $UserDatabases) {
     $CurrentDBName = $DB.name
     Write-Host "  -> Processing Database: $CurrentDBName" -ForegroundColor Green
 
-    # Query 1: Get all tables and schemas in the current database
-    # The SchemaName (s.name) will explicitly return 'dbo', 'guest', or custom schema names.
+    # Query 1: Get all tables and schemas, including type (BASE TABLE, VIEW, etc.)
     $TablesQuery = @"
     SELECT
-        s.name AS SchemaName,
-        t.name AS TableName
+        t.TABLE_SCHEMA AS SchemaName,
+        t.TABLE_NAME AS TableName,
+        t.TABLE_TYPE AS TableType -- New column for table type
     FROM
-        sys.tables t
-    INNER JOIN
-        sys.schemas s ON t.schema_id = s.schema_id
+        INFORMATION_SCHEMA.TABLES t
     WHERE
-        t.is_ms_shipped = 0 
+        t.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
     ORDER BY SchemaName, TableName;
 "@
 
@@ -146,77 +139,118 @@ foreach ($DB in $UserDatabases) {
         Write-Warning "   Skipping database $CurrentDBName due to error. Details logged."
         Write-InventoryLog "ERROR: Skipping database $CurrentDBName. Likely permissions issue. Error: $($Tables)"
         
-        $GlobalInventory += New-Object PSObject -Property @{
-            Technology = "SQL Server";
-            Version = $SqlServerVersion;
-            DatabaseName = $CurrentDBName;
-            Status = "Access Denied";
-            HasData = "N/A";
-            TableName = "N/A";
-            SchemaName = "N/A"
+        $GlobalTableInventory += New-Object PSObject -Property @{
+            Version = $SqlServerVersion; DatabaseName = $CurrentDBName; Status = "Access Denied";
+            HasData = "N/A"; TableType = "N/A"; TableName = "N/A"; SchemaName = "N/A"
         }
         continue 
     }
 
-    # Iterate over each Table in the current Database
+    # Query 2: Get all column information for the current database
+    $ColumnsQuery = @"
+    SELECT
+        '$CurrentDBName' AS DatabaseName,
+        c.TABLE_SCHEMA AS SchemaName,
+        c.TABLE_NAME AS TableName,
+        c.COLUMN_NAME AS ColumnName,
+        c.ORDINAL_POSITION AS OrdinalPosition,
+        c.DATA_TYPE AS DataType,
+        c.CHARACTER_MAXIMUM_LENGTH AS MaxLength,
+        c.IS_NULLABLE AS IsNullable
+    FROM
+        INFORMATION_SCHEMA.COLUMNS c
+    WHERE
+        c.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys', 'guest', 'cdc')
+    ORDER BY SchemaName, TableName, OrdinalPosition;
+"@
+    $Columns = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $ColumnsQuery
+    
+    if ($Columns -is [string] -and $Columns.StartsWith("ERROR:")) {
+         Write-InventoryLog "WARNING: Could not retrieve column details for $CurrentDBName. Error: $($Columns)"
+    } else {
+        $GlobalColumnInventory += $Columns
+    }
+
+
+    # Iterate over each Table for row count (only for BASE TABLE)
     foreach ($Table in $Tables) {
         $Schema = $Table.SchemaName
         $TableName = $Table.TableName
+        $TableType = $Table.TableType
+        $Status = "Connected"
+        $HasData = "N/A"
 
-        # Query 2: Check for data (Row Count)
-        $CountQuery = "SELECT COUNT_BIG(*) FROM [$Schema].[$TableName];"
-        $RowCount = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $CountQuery -IsCountQuery
-        
-        # Check if CountQuery failed (e.g., table access denied)
-        if ($RowCount -is [string] -and $RowCount.StartsWith("ERROR:")) {
-            Write-InventoryLog "WARNING: Could not count rows in $CurrentDBName.$Schema.$TableName. Skipping row count. Error: $($RowCount)"
-            $Status = "Connected (No Count Permission)"
-            $HasData = "N/A"
-        } else {
-            $Status = "Connected"
-            $HasData = if ($RowCount -gt 0) { "Yes" } else { "No" }
+        if ($TableType -eq 'BASE TABLE') {
+            # Query 3: Check for data (Row Count)
+            $CountQuery = "SELECT COUNT_BIG(*) FROM [$Schema].[$TableName];"
+            $RowCount = Invoke-SqlClientQuery -CurrentDB $CurrentDBName -Query $CountQuery -IsCountQuery
+            
+            if ($RowCount -is [string] -and $RowCount.StartsWith("ERROR:")) {
+                Write-InventoryLog "WARNING: Could not count rows in $CurrentDBName.$Schema.$TableName. Skipping row count. Error: $($RowCount)"
+                $Status = "Connected (No Count Permission)"
+            } else {
+                $HasData = if ($RowCount -gt 0) { "Yes" } else { "No" }
+            }
         }
-
-        # Create the final object with properties in the correct order
+        
+        # Create the final table object 
         $TableObject = New-Object PSObject -Property @{
-            Technology = "SQL Server";
             Version = $SqlServerVersion;
             DatabaseName = $CurrentDBName;
             Status = $Status;
-            HasData = $HasData; # Changed order
+            TableType = $TableType; # New column
+            SchemaName = $Schema;
             TableName = $TableName;
-            SchemaName = $Schema # 'dbo' or custom schema
+            HasData = $HasData;
         }
         
-        $GlobalInventory += $TableObject
+        $GlobalTableInventory += $TableObject
     }
 }
 
 
 # --- 4. EXPORT RESULTS TO CSV ---
 
-if ($GlobalInventory.Count -gt 0) {
+if ($GlobalTableInventory.Count -gt 0) {
     
-    # Define the final property order for the CSV
-    $CsvProperties = @(
-        'Technology', 
+    # 4.1 Export TABLES Inventory
+    $TableCsvProperties = @(
         'Version', 
         'DatabaseName', 
-        'Status',  
-        'HasData',
+        'Status', 
+        'TableType', # Added
+        'SchemaName', 
         'TableName',
-        'SchemaName'
+        'HasData'
     )
+    $GlobalTableInventory | Select-Object -Property $TableCsvProperties | Export-Csv -Path $TableOutputFile -NoTypeInformation -Delimiter ','
+    Write-InventoryLog "SUCCESS: Tables inventory exported to $TableOutputFile."
+    Write-Host "`n✅ Tables Inventory exported to: $TableOutputFile" -ForegroundColor Green
 
-    # Use comma delimiter (standard for CSV) and select properties in the correct order
-    $GlobalInventory | Select-Object -Property $CsvProperties | Export-Csv -Path $OutputFile -NoTypeInformation -Delimiter ','
-    
-    Write-InventoryLog "--- Inventory finished. Total records exported: $($GlobalInventory.Count) ---"
-    Write-Host "`n✅ Success! SQL Server Inventory completed." -ForegroundColor Green
-    Write-Host "Total records exported: $($GlobalInventory.Count)" -ForegroundColor Green
-    Write-Host "The CSV file was saved to: $OutputFile" -ForegroundColor Green
+    # 4.2 Export COLUMNS Inventory
+    if ($GlobalColumnInventory.Count -gt 0) {
+        $ColumnCsvProperties = @(
+            'DatabaseName',
+            'SchemaName',
+            'TableName',
+            'ColumnName',
+            'OrdinalPosition',
+            'DataType',
+            'MaxLength',
+            'IsNullable'
+        )
+        $GlobalColumnInventory | Select-Object -Property $ColumnCsvProperties | Export-Csv -Path $ColumnOutputFile -NoTypeInformation -Delimiter ','
+        Write-InventoryLog "SUCCESS: Columns inventory exported to $ColumnOutputFile."
+        Write-Host "✅ Columns Inventory exported to: $ColumnOutputFile" -ForegroundColor Green
+    } else {
+        Write-Warning "⚠️ Warning: No column records were found to export."
+        Write-InventoryLog "WARNING: No column records were found to export."
+    }
+
+    Write-InventoryLog "--- Inventory finished. Total table records: $($GlobalTableInventory.Count) ---"
     Write-Host "Check log file for errors: $LogFile" -ForegroundColor Yellow
 
 } else {
     Write-Warning "`n⚠️ Warning: No table records were found to export."
     Write-InventoryLog "WARNING: No table records were found to export."
+}
