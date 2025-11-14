@@ -1,18 +1,28 @@
-# --- 1. Definición de Filtros ---
-$ExcludeAccounts = "LocalSystem", "NT Authority", "NetworkService", "LocalService", "System"
-$WindowsPath = "C:\Windows\"
+# --- 1. Definición de Filtros de Exclusión (Compatibilidad y Exclusión de Edge) ---
+
+# Obtener la letra del disco donde está instalado Windows (e.g., C:)
+$SystemDrive = $env:SystemDrive
+
+# DIRECTORIOS DE EXCLUSIÓN: Solo se excluyen si están en el disco del sistema ($SystemDrive).
+$WindowsPaths = @(
+    "$SystemDrive\Windows\",
+    "$SystemDrive\Program Files\Windows NT\",
+    "$SystemDrive\Program Files\Common Files\",
+    "$SystemDrive\Program Files (x86)\Common Files\",
+    "$SystemDrive\Program Files\Hyper-V",
+    "$SystemDrive\Program Files\Microsoft\", # Excluye Edge, Visual Studio, etc.
+    "$SystemDrive\Program Files (x86)\Microsoft\", # Excluye Edge, Visual Studio, etc.
+    # Excluir la carpeta de la Tienda de Windows y Apps de usuario
+    "$SystemDrive\Program Files\WindowsApps\",
+    "$SystemDrive\Users\"
+)
 
 # --- 2. Recolección de Información del Servidor (IP y Dominio) ---
 Write-Host "## 🌐 Información del Servidor" -ForegroundColor Cyan
 try {
-    # Obtener el nombre de dominio (si está unido a uno)
     $DomainInfo = Get-CimInstance -ClassName Win32_ComputerSystem
     $Domain = $DomainInfo.Domain
-    if ($Domain -eq $null -or $Domain -eq "") {
-        $Domain = "WORKGROUP (No unido a dominio)"
-    }
-
-    # Obtener la(s) dirección(es) IP
+    if ($Domain -eq $null -or $Domain -eq "") { $Domain = "WORKGROUP (No unido a dominio)" }
     $IPAddresses = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike "Loopback*" -and $_.IPAddress -notlike "169.254.*" } | Select-Object -ExpandProperty IPAddress -Unique
 
     Write-Host "   - Nombre del Servidor: $($DomainInfo.Name)" -ForegroundColor Green
@@ -24,50 +34,64 @@ try {
 }
 
 Write-Host "`n"
-Write-Host "## ⚙️ Servicios No Nativos con Detalle de Ejecución y Puertos" -ForegroundColor Yellow
+Write-Host "## 🔎 Procesos / Aplicaciones / Servicios No Nativos Encontrados" -ForegroundColor Yellow
 Write-Host "---"
 
-# --- 3. Recolección y Filtrado de Servicios ---
+# --- 3. Recolección de Conexiones de Red (Compatible: netstat -ano) ---
 
-# Obtener todos los servicios junto con su PathName (Comando de Ejecución)
-$AllServices = Get-Service |
-    Select-Object -Property Name, DisplayName, ServiceAccount, Status, @{Name='PathName';Expression={(Get-WmiObject -Class Win32_Service -Filter "Name='$($_.Name)'").PathName}},
-                                                                    @{Name='PID';Expression={(Get-WmiObject -Class Win32_Service -Filter "Name='$($_.Name)'").ProcessId}} |
-    Where-Object {
-        # Filtro: NO es una cuenta de sistema Y NO está en la ruta de Windows
-        -not ($ExcludeAccounts | Where-Object { $_ -eq $_.PathName -or $_ -like "*$($_.ServiceAccount)*" }) -and ($null -ne $_.PathName -and $_.PathName -notlike "*$WindowsPath*")
-    }
+# Ejecutar netstat -ano una sola vez y guardar la tabla de conexiones activas
+$NetstatOutput = netstat -ano | Select-String -Pattern "TCP|UDP"
 
-# --- 4. Procesamiento y Salida de Puertos (Requiere elevación, que ya se debe tener) ---
+# --- 4. Recolección y Filtrado de Procesos ---
 
-$NonWindowsServicesDetails = @()
+# Obtener todos los procesos con su ruta de archivo (Path)
+$AllProcesses = Get-Process | Select-Object -Property ProcessName, Id, Path | Where-Object {$_.Path -ne $null}
+$NonNativeProcessesDetails = @()
 
-foreach ($Service in $AllServices) {
-    $Ports = @()
+foreach ($Process in $AllProcesses) {
+    $IsWindowsNative = $false
 
-    if ($Service.PID -ne 0) {
-        # Usar Get-NetTCPConnection y Get-NetUDPConnection para encontrar los puertos asociados al PID
-        $Connections = Get-NetTCPConnection -OwningProcess $Service.PID -ErrorAction SilentlyContinue
-        $Connections += Get-NetUDPConnection -OwningProcess $Service.PID -ErrorAction SilentlyContinue
-
-        if ($Connections.Count -gt 0) {
-            $Connections | ForEach-Object {
-                $Protocol = $_.Protocol
-                $LocalPort = $_.LocalPort
-                $Ports += "$Protocol/$LocalPort"
-            }
+    # Comprobar si el PathName se encuentra en alguno de los directorios de exclusión de Windows (en el disco del sistema)
+    foreach ($ExcludePath in $WindowsPaths) {
+        if ($Process.Path -like "$ExcludePath*") {
+            $IsWindowsNative = $true
+            break
         }
     }
 
-    # Construir el objeto de salida
-    $NonWindowsServicesDetails += [PSCustomObject]@{
-        'Nombre del Servicio'        = $Service.Name
-        'Comando de Ejecución'       = $Service.PathName
-        'PID'                        = $Service.PID
-        'Puertos (TCP/UDP)'          = if ($Ports.Count -gt 0) { $Ports -join ', ' } else { "N/A o No Escuchando" }
-        'Directorio Raíz Estimado'   = Split-Path -Path $Service.PathName -Parent
+    # Si NO es nativo, procesar
+    if (-not $IsWindowsNative) {
+        $Ports = @()
+
+        # Buscar el PID del proceso en la salida de netstat -ano
+        $NetstatOutput | ForEach-Object {
+            $Line = $_.ToString().Trim()
+            $Parts = $Line -split "\s+"
+
+            # El último elemento del array Parts es el PID
+            if ($Parts[-1] -eq $Process.Id) {
+                $Protocol = $Parts[0] # TCP o UDP
+
+                # El tercer elemento es la dirección local y el puerto (ej: 0.0.0.0:80)
+                $Port = $Parts[2] -split ":" | Select-Object -Last 1
+
+                $Ports += "$Protocol/$Port"
+            }
+        }
+
+        # Eliminar duplicados de puertos (si un mismo PID tiene varias conexiones)
+        $UniquePorts = $Ports | Select-Object -Unique
+
+        # Construir el objeto de salida
+        $NonNativeProcessesDetails += [PSCustomObject]@{
+            'Nombre del Proceso (EXE)'   = $Process.ProcessName
+            'PID'                        = $Process.Id
+            'Directorio Raíz Estimado'   = Split-Path -Path $Process.Path -Parent
+            'Ruta Completa del Binario'  = $Process.Path
+            'Puertos (TCP/UDP)'          = if ($UniquePorts.Count -gt 0) { $UniquePorts -join ', ' } else { "N/A o No Escuchando" }
+        }
     }
 }
 
-# Mostrar los resultados
-$NonWindowsServicesDetails | Format-Table -AutoSize
+# Mostrar los resultados ordenados y formateados
+$NonNativeProcessesDetails | Sort-Object -Property 'Nombre del Proceso (EXE)' | Format-Table -AutoSize
