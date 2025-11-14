@@ -50,7 +50,7 @@ $NonNativeProcessesDetails = @()
 
 foreach ($Process in $AllProcesses) {
     $IsWindowsNative = $false
-
+    
     # Comprobar si el PathName se encuentra en alguno de los directorios de exclusión de Windows (en el disco del sistema)
     foreach ($ExcludePath in $WindowsPaths) {
         if ($Process.Path -like "$ExcludePath*") {
@@ -62,23 +62,23 @@ foreach ($Process in $AllProcesses) {
     # Si NO es nativo, procesar
     if (-not $IsWindowsNative) {
         $Ports = @()
-
+        
         # Buscar el PID del proceso en la salida de netstat -ano
         $NetstatOutput | ForEach-Object {
             $Line = $_.ToString().Trim()
             $Parts = $Line -split "\s+"
-
+            
             # El último elemento del array Parts es el PID
             if ($Parts[-1] -eq $Process.Id) {
                 $Protocol = $Parts[0] # TCP o UDP
-
+                
                 # El tercer elemento es la dirección local y el puerto (ej: 0.0.0.0:80)
                 $Port = $Parts[2] -split ":" | Select-Object -Last 1
-
+                
                 $Ports += "$Protocol/$Port"
             }
         }
-
+        
         # Eliminar duplicados de puertos (si un mismo PID tiene varias conexiones)
         $UniquePorts = $Ports | Select-Object -Unique
 
